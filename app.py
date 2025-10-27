@@ -1,107 +1,141 @@
 import streamlit as st
 import pandas as pd
+from fuzzywuzzy import process
 from io import BytesIO
+import requests
+from lxml import html
 
-# --- Default Company URLs ---
-company_data = {
-    "JSW Steel": {
-        "BS_URL": "https://www.moneycontrol.com/financials/jswsteel/balance-sheetVI/JSW01#JSW01",
-        "PL_URL": "https://www.moneycontrol.com/financials/jswsteel/profit-lossVI/JSW01#JSW01"
-    },
-    "Grasim Industries": {
-        "BS_URL": "https://www.moneycontrol.com/financials/grasimindustries/balance-sheetVI/GI#GI",
-        "PL_URL": "https://www.moneycontrol.com/financials/grasimindustries/profit-lossVI/GI#GI"
-    },
-    "SBI Life Insurance": {
-        "BS_URL": "https://www.moneycontrol.com/financials/sbilifeinsurancecompany/balance-sheetVI/SLI03#SLI03",
-        "PL_URL": "https://www.moneycontrol.com/financials/sbilifeinsurancecompany/profit-lossVI/SLI03#SLI03"
-    },
-    "Axis Bank": {
-        "BS_URL": "https://www.moneycontrol.com/financials/axisbank/balance-sheetVI/AB16#AB16",
-        "PL_URL": "https://www.moneycontrol.com/financials/axisbank/consolidated-profit-lossVI/AB16#AB16"
-    },
-    "HDFC Bank": {
-        "BS_URL": "https://www.moneycontrol.com/financials/hdfcbank/balance-sheetVI/HDF01#HDF01",
-        "PL_URL": "https://www.moneycontrol.com/financials/hdfcbank/profit-lossVI/hdf01"
+# -----------------------------------
+# PAGE CONFIG
+# -----------------------------------
+st.set_page_config(page_title="Company Financials Explorer", layout="wide")
+st.title("📊 Company Financials Explorer")
+st.markdown("View **Balance Sheet** and **Profit & Loss** data from [Moneycontrol](https://www.moneycontrol.com).")
+
+# -----------------------------------
+# LOAD COMPANY DATABASE
+# -----------------------------------
+@st.cache_data
+def load_company_data():
+    df = pd.read_csv("moneycontrol_links.csv")
+    df.dropna(subset=["BalanceSheetURL", "ProfitLossURL"], inplace=True)
+    company_dict = {
+        row["Company"]: {
+            "BS_URL": row["BalanceSheetURL"],
+            "PL_URL": row["ProfitLossURL"]
+        }
+        for _, row in df.iterrows()
     }
-}
+    return company_dict
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Company Financial Dashboard", layout="wide")
-st.title("📊 Company Financial Dashboard")
-st.markdown("Explore **Balance Sheet** and **Profit & Loss** data from Moneycontrol.")
+company_data = load_company_data()
+company_names = list(company_data.keys())
 
-# --- Input Section ---
-col1, col2 = st.columns([2, 3])
-with col1:
-    company_choice = st.selectbox("Choose a company:", list(company_data.keys()) + ["Custom URL"])
-with col2:
-    st.info("💡 Select a company or enter your own Moneycontrol URLs below.")
+# -----------------------------------
+# AUTOCOMPLETE DROPDOWN USING FUZZY MATCH
+# -----------------------------------
+st.sidebar.header("🔎 Company Search")
 
-custom_bs_url = st.text_input("🔗 Custom Balance Sheet URL (optional):")
-custom_pl_url = st.text_input("🔗 Custom Profit & Loss URL (optional):")
+def suggest_matches(user_input, choices, limit=5):
+    if not user_input:
+        return []
+    matches = process.extract(user_input, choices, limit=limit)
+    return [m[0] for m in matches if m[1] >= 60]
 
-# --- Get URLs based on user input ---
-if company_choice != "Custom URL":
-    urls = company_data[company_choice]
+user_input = st.sidebar.text_input("Type company name:").strip()
+suggestions = suggest_matches(user_input, company_names)
+
+selected_company = None
+if suggestions:
+    selected_company = st.sidebar.selectbox("📍 Suggestions:", suggestions)
 else:
-    urls = {"BS_URL": custom_bs_url, "PL_URL": custom_pl_url}
+    st.sidebar.info("Type at least 3 letters to see suggestions.")
 
-# --- Cached fetch function ---
+custom_bs_url = ""
+custom_pl_url = ""
+
+if not selected_company and user_input:
+    st.sidebar.warning("⚠️ No close match found. Enter URLs manually.")
+    custom_bs_url = st.sidebar.text_input("Enter Balance Sheet URL:")
+    custom_pl_url = st.sidebar.text_input("Enter Profit & Loss URL:")
+
+# -----------------------------------
+# FETCH & PARSE DATA SAFELY
+# -----------------------------------
 @st.cache_data(show_spinner=True)
-def fetch_data(bs_url, pl_url):
-    bs_df = pd.read_html(bs_url, header=0, skiprows=(1, 2, 3))[0].iloc[:, 0:6]
-    pl_df = pd.read_html(pl_url, header=0, skiprows=(1, 2))[0].iloc[:, 0:6]
-    return bs_df, pl_df
+def fetch_tables(url):
+    try:
+        response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        tree = html.fromstring(response.content)
+        tables = pd.read_html(response.text)
+        return tables[0] if tables else None
+    except Exception:
+        return None
 
-# --- Fetch Button ---
-if st.button("🚀 Fetch Financial Data"):
-    if not urls["BS_URL"] or not urls["PL_URL"]:
-        st.error("⚠️ Please provide both Balance Sheet and Profit & Loss URLs.")
-    else:
-        try:
-            bs_df, pl_df = fetch_data(urls["BS_URL"], urls["PL_URL"])
+# -----------------------------------
+# FETCH BUTTON
+# -----------------------------------
+if st.sidebar.button("🚀 Fetch Financial Data"):
+    try:
+        if selected_company:
+            urls = company_data[selected_company]
+        elif custom_bs_url and custom_pl_url:
+            urls = {"BS_URL": custom_bs_url, "PL_URL": custom_pl_url}
+        else:
+            st.error("❌ Please select a valid company or enter URLs manually.")
+            st.stop()
 
-            st.success("✅ Data fetched successfully!")
+        bs_df = fetch_tables(urls["BS_URL"])
+        pl_df = fetch_tables(urls["PL_URL"])
 
-            # --- Display Data ---
-            st.subheader("📘 Balance Sheet")
-            st.dataframe(bs_df, use_container_width=True)
+        if bs_df is None or pl_df is None:
+            st.error("❌ No financial tables found. The Moneycontrol page might have changed or the company data is unavailable.")
+            st.stop()
 
-            st.subheader("📗 Profit & Loss")
-            st.dataframe(pl_df, use_container_width=True)
+        # Display Results
+        st.success(f"📈 Data fetched successfully for **{selected_company or 'Custom Company'}**")
 
-            # --- Visualization ---
-            st.markdown("### 📈 Quick Visualization")
-            col1, col2 = st.columns(2)
+        st.subheader("📘 Balance Sheet")
+        st.dataframe(bs_df, use_container_width=True)
 
-            with col1:
-                st.write("**Total Assets Trend (Balance Sheet)**")
-                bs_df_melt = bs_df.melt(id_vars=bs_df.columns[0], var_name="Year", value_name="Value")
-                bs_assets = bs_df_melt[bs_df_melt[bs_df.columns[0]].str.contains("Total Assets", case=False, na=False)]
-                if not bs_assets.empty:
-                    st.bar_chart(bs_assets.set_index("Year")["Value"])
+        st.subheader("📗 Profit & Loss Statement")
+        st.dataframe(pl_df, use_container_width=True)
 
-            with col2:
-                st.write("**Net Profit Trend (Profit & Loss)**")
-                pl_df_melt = pl_df.melt(id_vars=pl_df.columns[0], var_name="Year", value_name="Value")
-                pl_profit = pl_df_melt[pl_df_melt[pl_df.columns[0]].str.contains("Net Profit", case=False, na=False)]
-                if not pl_profit.empty:
-                    st.line_chart(pl_profit.set_index("Year")["Value"])
+        # -----------------------------------
+        # VISUALIZATION
+        # -----------------------------------
+        st.markdown("### 📊 Financial Highlights")
+        col1, col2 = st.columns(2)
 
-            # --- Excel Download ---
-            combined_excel = BytesIO()
-            with pd.ExcelWriter(combined_excel, engine='openpyxl') as writer:
-                bs_df.to_excel(writer, sheet_name="Balance Sheet", index=False)
-                pl_df.to_excel(writer, sheet_name="Profit & Loss", index=False)
-            combined_excel.seek(0)
+        with col1:
+            st.write("**Total Assets Trend (Balance Sheet)**")
+            bs_melt = bs_df.melt(id_vars=bs_df.columns[0], var_name="Year", value_name="Value")
+            assets = bs_melt[bs_melt[bs_df.columns[0]].str.contains("Total Assets", case=False, na=False)]
+            if not assets.empty:
+                st.bar_chart(assets.set_index("Year")["Value"])
 
-            st.download_button(
-                label="⬇️ Download Full Report (Excel)",
-                data=combined_excel,
-                file_name=f"{company_choice.replace(' ', '_')}_Financials.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        with col2:
+            st.write("**Net Profit Trend (Profit & Loss)**")
+            pl_melt = pl_df.melt(id_vars=pl_df.columns[0], var_name="Year", value_name="Value")
+            profits = pl_melt[pl_melt[pl_df.columns[0]].str.contains("Net Profit", case=False, na=False)]
+            if not profits.empty:
+                st.line_chart(profits.set_index("Year")["Value"])
 
-        except Exception as e:
-            st.error(f"❌ Failed to fetch or process data: {e}")
+        # -----------------------------------
+        # DOWNLOAD REPORT
+        # -----------------------------------
+        combined_excel = BytesIO()
+        with pd.ExcelWriter(combined_excel, engine="openpyxl") as writer:
+            bs_df.to_excel(writer, sheet_name="Balance Sheet", index=False)
+            pl_df.to_excel(writer, sheet_name="Profit & Loss", index=False)
+        combined_excel.seek(0)
+
+        st.download_button(
+            label="⬇️ Download Full Report (Excel)",
+            data=combined_excel,
+            file_name=f"{(selected_company or 'Custom_Company').replace(' ', '_')}_Financials.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        st.error(f"❌ Error fetching or processing data: {e}")
